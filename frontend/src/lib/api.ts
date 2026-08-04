@@ -47,16 +47,33 @@ const USERNAME_KEY = 'username';
 export const getToken = (): string | null =>
   typeof window !== 'undefined' ? localStorage.getItem(TOKEN_KEY) : null;
 
-export const isAuthenticated = (): boolean => !!getToken();
+export const isAuthenticated = (): boolean => {
+  if (typeof window === 'undefined') return false;
+  const hasLocal = !!localStorage.getItem(TOKEN_KEY);
+  const hasCookie = document.cookie.includes('jwt_token=');
+  
+  if (hasLocal && !hasCookie) {
+    // If cookie expired or is missing but localStorage stuck around, purge to match server state!
+    clearToken();
+    return false;
+  }
+  
+  return hasLocal && hasCookie;
+};
 
 export const clearToken = (): void => {
-  localStorage.removeItem(TOKEN_KEY);
-  localStorage.removeItem(USERNAME_KEY);
+  if (typeof window !== 'undefined') {
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(USERNAME_KEY);
+    document.cookie = 'jwt_token=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+  }
 };
 
 export const logout = (): void => {
   clearToken();
-  window.location.href = '/login';
+  if (typeof window !== 'undefined') {
+      window.location.href = '/login';
+  }
 };
 
 // ── Auth API ─────────────────────────────────────────────────────────────────
@@ -67,8 +84,11 @@ export interface RegisterRequest { username: string; email: string; password: st
 
 export const login = async (req: LoginRequest): Promise<LoginResponse> => {
   const { data } = await authClient.post<LoginResponse>('/login', req);
-  localStorage.setItem(TOKEN_KEY, data.token);
-  localStorage.setItem(USERNAME_KEY, data.username);
+  if (typeof window !== 'undefined') {
+    localStorage.setItem(TOKEN_KEY, data.token);
+    localStorage.setItem(USERNAME_KEY, data.username);
+    document.cookie = `jwt_token=${data.token}; path=/; max-age=86400; SameSite=Strict`;
+  }
   return data;
 };
 
@@ -88,20 +108,39 @@ export interface AiRequest {
   dietaryPreferences: string;
 }
 
+export interface MealItem {
+  name: string;
+  grams: string;
+  calories: number;
+  protein: number;
+  carbs: number;
+  fat: number;
+}
+
 export interface DailyMeals {
-  breakfast: string;
-  lunch: string;
-  dinner: string;
-  snacks: string;
+  breakfast: MealItem;
+  lunch: MealItem;
+  dinner: MealItem;
+  snacks: MealItem;
   calories: number;
 }
 
 export interface AiDietResponse {
+  success?: boolean;
+  message?: string;
+  error?: string;
   calories: number;
   macros: { protein: number; carbs: number; fats: number };
-  meal_plan: { breakfast: string; lunch: string; dinner: string; snacks: string };
+  meal_plan: { breakfast: MealItem; lunch: MealItem; dinner: MealItem; snacks: MealItem };
   weekly_plan?: Record<string, DailyMeals>;
   tips: string[];
+}
+
+export interface AiWeeklyDietResponse {
+  success?: boolean;
+  message?: string;
+  error?: string;
+  weekly_plan: Record<string, DailyMeals>;
 }
 
 export interface AiRecommendationsResponse {
@@ -114,14 +153,72 @@ export interface ChatMessage { role: 'user' | 'ai'; content: string; }
 export interface AiChatRequest { message: string; goal?: string; caloriesTarget?: number; history?: ChatMessage[]; }
 export interface AiChatResponse { reply: string; }
 
-export const generateDietPlan = async (req: AiRequest): Promise<AiDietResponse> =>
-  (await apiClient.post<AiDietResponse>('/ai/diet', req)).data;
+const handleAiError = (error: any): never => {
+  const status = error.response?.status;
+  if (status === 401 || status === 403) {
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('jwt_token');
+      localStorage.removeItem('username');
+      document.cookie = 'jwt_token=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+      window.location.href = '/login';
+    }
+    throw new Error('Session expired. Redirecting to login...');
+  }
+  if (status === 503 || status === 500) {
+    const backendMessage = error.response?.data?.error || 'The AI is currently overloaded. Please wait a few seconds and try again.';
+    throw new Error(backendMessage); 
+  }
+  throw new Error(error.response?.data?.message || 'An unexpected API error occurred');
+};
 
-export const generateRecommendations = async (req: AiRequest): Promise<AiRecommendationsResponse> =>
-  (await apiClient.post<AiRecommendationsResponse>('/ai/recommendations', req)).data;
+const getAuthHeaders = () => {
+    let token = '';
+    if (typeof window !== 'undefined') {
+        token = localStorage.getItem('jwt_token') || '';
+    }
+    return {
+        'Content-Type': 'application/json',
+        ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+    };
+};
 
-export const sendChatMessage = async (req: AiChatRequest): Promise<AiChatResponse> =>
-  (await apiClient.post<AiChatResponse>('/ai/chat', req)).data;
+export const generateDietPlan = async (req: AiRequest): Promise<AiDietResponse> => {
+  try {
+    const response = await axios.post<AiDietResponse>(`${BASE_URL}/api/ai/diet`, req, { headers: getAuthHeaders() });
+    return response.data;
+  } catch (error: any) {
+    return handleAiError(error);
+  }
+};
+
+// Weekly plan is generated separately, on demand, since it's a much larger
+// generation than the daily plan and shouldn't block the initial result.
+export const generateWeeklyDietPlan = async (req: AiRequest): Promise<AiWeeklyDietResponse> => {
+  try {
+    const response = await axios.post<AiWeeklyDietResponse>(`${BASE_URL}/api/ai/diet/weekly`, req, { headers: getAuthHeaders() });
+    return response.data;
+  } catch (error: any) {
+    return handleAiError(error);
+  }
+};
+
+export const generateRecommendations = async (req: AiRequest): Promise<AiRecommendationsResponse> => {
+  try {
+    const response = await axios.post<AiRecommendationsResponse>(`${BASE_URL}/api/ai/recommendations`, req, { headers: getAuthHeaders() });
+    return response.data;
+  } catch (error: any) {
+    return handleAiError(error);
+  }
+};
+
+export const sendChatMessage = async (req: AiChatRequest): Promise<AiChatResponse> => {
+  try {
+    const response = await axios.post<AiChatResponse>(`${BASE_URL}/api/ai/chat`, req, { headers: getAuthHeaders() });
+    return response.data;
+  } catch (error: any) {
+    return handleAiError(error);
+  }
+};
 
 // ── Health Calculation API ────────────────────────────────────────────────────
 // These POST calls persist records to the DB and power the dashboard history.

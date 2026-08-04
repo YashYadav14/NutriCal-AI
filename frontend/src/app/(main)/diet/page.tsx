@@ -2,7 +2,7 @@
 
 import React, { useState } from "react";
 import {
-  AiRequest, AiDietResponse, generateDietPlan,
+  AiRequest, AiDietResponse, generateDietPlan, generateWeeklyDietPlan,
   calculateBmi, calculateCalories, calculateMacros
 } from "@/lib/api";
 import { Card, CardHeader, CardContent } from "@/components/ui/Card";
@@ -11,12 +11,27 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Loader2, ArrowLeft, Zap, Sparkles, MoveRight, CheckCircle2 } from "lucide-react";
 import Link from "next/link";
 
+// Canonical display order for meals. Chosen deliberately (snack sits between
+// lunch and dinner, matching how people actually eat through the day) rather
+// than relying on whatever key order the API/AI happens to return — that
+// order isn't guaranteed and shouldn't drive the UI's numbering.
+const MEAL_ORDER = ['breakfast', 'lunch', 'snacks', 'dinner'] as const;
+
+function orderedMealEntries(mealPlan: Record<string, any> | undefined | null): [string, any][] {
+  if (!mealPlan) return [];
+  return MEAL_ORDER
+    .filter((key) => key in mealPlan)
+    .map((key) => [key, mealPlan[key]] as [string, any]);
+}
+
 export default function DietGenerator() {
   const [loading, setLoading] = useState(false);
   const [response, setResponse] = useState<AiDietResponse | null>(null);
   const [error, setError] = useState("");
-  const [viewMode, setViewMode] = useState<'daily'|'weekly'>('weekly');
+  const [viewMode, setViewMode] = useState<'daily'|'weekly'>('daily');
   const [selectedDay, setSelectedDay] = useState<string>('monday');
+  const [weeklyLoading, setWeeklyLoading] = useState(false);
+  const [weeklyError, setWeeklyError] = useState("");
 
   const [formData, setFormData] = useState<AiRequest>({
     weight: 70,
@@ -78,41 +93,17 @@ export default function DietGenerator() {
     setResponse(null);
 
     try {
-      let data = await generateDietPlan(formData).catch(() => null);
-      
-      // Fallback for Gemini rate-limit failure
+      const data = await generateDietPlan(formData);
+
       if (!data || (data as any).success === false) {
-          data = {
-              calories: 2200,
-              macros: { protein: 150, carbs: 200, fats: 70 },
-              meal_plan: { breakfast: "Oats", lunch: "Chicken", dinner: "Fish", snacks: "Nuts" } as any,
-              weekly_plan: {
-                  monday: { breakfast: "Oats", lunch: "Chicken", dinner: "Fish", snacks: "Nuts", calories: 2200 } as any,
-                  tuesday: { breakfast: "Eggs", lunch: "Turkey", dinner: "Beef", snacks: "Fruit", calories: 2200 } as any,
-                  wednesday: { breakfast: "Protein Shake", lunch: "Salad", dinner: "Tofu", snacks: "Yogurt", calories: 2200 } as any,
-                  thursday: { breakfast: "Pancakes", lunch: "Wrap", dinner: "Pasta", snacks: "Apple", calories: 2200 } as any,
-                  friday: { breakfast: "Toast", lunch: "Soup", dinner: "Steak", snacks: "Cheese", calories: 2200 } as any,
-                  saturday: { breakfast: "Smoothie", lunch: "Burger", dinner: "Pizza", snacks: "Chips", calories: 2500 } as any,
-                  sunday: { breakfast: "Bacon", lunch: "Roast", dinner: "Salmon", snacks: "Cake", calories: 2500 } as any
-              },
-              tips: ["Stay hydrated", "Sleep well"]
-          } as unknown as AiDietResponse;
+        throw new Error((data as any)?.message || "Failed to generate your plan. Please try again.");
       }
-      
-      // Normalize weekly plan
-      if (data) {
-        const weekly = data.weekly_plan || (data as any).weeklyPlan || (data as any).data?.weeklyPlan;
-        if (weekly) {
-            data.weekly_plan = weekly;
-        }
-        
-        setResponse(data);
-        localStorage.setItem("cachedDietPlan", JSON.stringify(data));
-        if (data.weekly_plan) {
-            setViewMode('weekly');
-            setSelectedDay('monday');
-        }
-      }
+
+      setResponse(data);
+      localStorage.setItem("cachedDietPlan", JSON.stringify(data));
+      // Daily plan only for now — weekly is generated separately, on demand,
+      // when the user actually switches to the Weekly Plan tab.
+      setViewMode('daily');
 
       // 2. Persist biometric calculations to backend — powers dashboard history charts.
       console.log("Calling BMI, Calories, Macros APIs", {
@@ -152,6 +143,38 @@ export default function DietGenerator() {
       setError(errorMessage);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleShowWeekly = async () => {
+    setViewMode('weekly');
+    if (response?.weekly_plan || weeklyLoading) return; // already have it, or already fetching
+
+    setWeeklyLoading(true);
+    setWeeklyError("");
+    try {
+      const weekly = await generateWeeklyDietPlan(formData);
+      if (!weekly || (weekly as any).success === false || !weekly.weekly_plan) {
+        throw new Error((weekly as any)?.message || "Failed to generate your weekly plan. Please try again.");
+      }
+      setResponse((prev) => {
+        if (!prev) return prev;
+        const merged = { ...prev, weekly_plan: weekly.weekly_plan };
+        // Persist immediately so a reload (or a session bounce) doesn't throw away
+        // work that already finished generating.
+        try {
+          localStorage.setItem("cachedDietPlan", JSON.stringify(merged));
+        } catch (err) {
+          console.error("Failed to cache weekly plan:", err);
+        }
+        return merged;
+      });
+      setSelectedDay('monday');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Failed to generate your weekly plan. Please try again.";
+      setWeeklyError(msg);
+    } finally {
+      setWeeklyLoading(false);
     }
   };
 
@@ -389,43 +412,74 @@ export default function DietGenerator() {
                 </div>
 
                 {/* View Toggles */}
-                {response.weekly_plan && (
-                  <div className="flex justify-center mb-8">
-                    <div className="bg-gray-100 p-1 rounded-full inline-flex">
-                      <button 
-                        onClick={() => setViewMode('daily')}
-                        className={`px-6 py-2.5 rounded-full text-sm font-bold transition-all ${viewMode === 'daily' ? 'bg-white text-black shadow-[0_2px_10px_rgb(0,0,0,0.05)]' : 'text-gray-500 hover:text-black'}`}
-                      >
-                        Daily Plan
-                      </button>
-                      <button 
-                        onClick={() => setViewMode('weekly')}
-                        className={`px-6 py-2.5 rounded-full text-sm font-bold transition-all ${viewMode === 'weekly' ? 'bg-white text-black shadow-[0_2px_10px_rgb(0,0,0,0.05)]' : 'text-gray-500 hover:text-black'}`}
-                      >
-                        Weekly Plan
-                      </button>
-                    </div>
+                <div className="flex justify-center mb-8">
+                  <div className="bg-gray-100 p-1 rounded-full inline-flex">
+                    <button 
+                      onClick={() => setViewMode('daily')}
+                      className={`px-6 py-2.5 rounded-full text-sm font-bold transition-all ${viewMode === 'daily' ? 'bg-white text-black shadow-[0_2px_10px_rgb(0,0,0,0.05)]' : 'text-gray-500 hover:text-black'}`}
+                    >
+                      Daily Plan
+                    </button>
+                    <button 
+                      onClick={handleShowWeekly}
+                      className={`px-6 py-2.5 rounded-full text-sm font-bold transition-all ${viewMode === 'weekly' ? 'bg-white text-black shadow-[0_2px_10px_rgb(0,0,0,0.05)]' : 'text-gray-500 hover:text-black'}`}
+                    >
+                      Weekly Plan
+                    </button>
                   </div>
-                )}
+                </div>
 
                 <AnimatePresence mode="wait">
-                  {viewMode === 'daily' || !response.weekly_plan ? (
+                  {viewMode === 'daily' ? (
                     <motion.div 
                       key="daily"
                       initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}
                       className="grid grid-cols-1 md:grid-cols-2 gap-6"
                     >
-                      {Object.entries(response?.meal_plan || {}).map(([meal, description], i) => (
+                      {orderedMealEntries(response?.meal_plan).map(([meal, item], i) => (
                         <div key={meal} className="bg-white p-8 rounded-[2rem] border border-gray-100 shadow-[0_4px_20px_rgb(0,0,0,0.02)] hover:shadow-[0_8px_30px_rgb(0,0,0,0.06)] transition-all group">
                           <h3 className="text-sm font-bold text-gray-400 uppercase tracking-widest mb-4 flex items-center gap-2">
                             <span className="w-6 h-6 rounded-full bg-black text-white text-[10px] flex items-center justify-center">{i+1}</span>
                             {meal}
                           </h3>
-                          <p className="text-lg font-medium text-black leading-relaxed">{description as string}</p>
+                          {item && typeof item === 'object' && 'name' in (item as object) ? (
+                            <div className="space-y-3">
+                              <div>
+                                <h4 className="text-xl font-bold text-gray-900">{(item as any).name}</h4>
+                                <p className="text-sm text-gray-500 font-medium mt-1">{(item as any).grams}</p>
+                              </div>
+                              <div className="flex flex-wrap gap-2 pt-2 border-t border-gray-50">
+                                <span className="bg-gray-100 text-gray-700 px-3 py-1.5 rounded-xl text-[11px] uppercase tracking-wider font-bold">{(item as any).calories} KCAL</span>
+                                <span className="bg-blue-50 text-blue-700 px-3 py-1.5 rounded-xl text-[11px] uppercase tracking-wider font-bold">{(item as any).protein}g PRO</span>
+                                <span className="bg-orange-50 text-orange-700 px-3 py-1.5 rounded-xl text-[11px] uppercase tracking-wider font-bold">{(item as any).carbs}g CARB</span>
+                                <span className="bg-emerald-50 text-emerald-700 px-3 py-1.5 rounded-xl text-[11px] uppercase tracking-wider font-bold">{(item as any).fat}g FAT</span>
+                              </div>
+                            </div>
+                          ) : (
+                            <p className="text-lg font-medium text-black leading-relaxed">{item as string}</p>
+                          )}
                         </div>
                       ))}
                     </motion.div>
-                  ) : (
+                  ) : weeklyLoading ? (
+                    <motion.div
+                      key="weekly-loading"
+                      initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+                      className="flex flex-col items-center justify-center py-24 text-center"
+                    >
+                      <Loader2 className="animate-spin mb-4" size={32} />
+                      <p className="text-gray-500 font-medium">Building your 7-day plan — this takes a bit longer than the daily one...</p>
+                    </motion.div>
+                  ) : weeklyError ? (
+                    <motion.div
+                      key="weekly-error"
+                      initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+                      className="flex flex-col items-center justify-center py-16 text-center gap-4"
+                    >
+                      <p className="text-red-600 font-semibold max-w-md">{weeklyError}</p>
+                      <Button onClick={handleShowWeekly} variant="outline">Retry</Button>
+                    </motion.div>
+                  ) : !response.weekly_plan ? null : (
                     <motion.div 
                       key="weekly"
                       initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}
@@ -445,16 +499,18 @@ export default function DietGenerator() {
 
                       {/* Day Cards */}
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                        {Object.entries(response.weekly_plan[selectedDay] || {}).map(([meal, info], i) => {
-                          if (meal === 'calories') {
-                            return (
-                              <div key={meal} className="bg-indigo-50/50 p-8 rounded-[2rem] border border-indigo-100/50 shadow-sm flex items-center justify-between col-span-1 md:col-span-2 group hover:bg-indigo-50 transition-all">
-                                <h3 className="text-sm font-bold text-indigo-500 uppercase tracking-widest flex items-center gap-2">Target Calories</h3>
-                                <p className="text-4xl font-extrabold text-indigo-950">{info as number} <span className="text-sm font-bold text-indigo-400">kcal</span></p>
-                              </div>
-                            );
-                          }
+                        {(() => {
+                          const dayPlan = response.weekly_plan[selectedDay] || {};
+                          const targetCalories = (dayPlan as any).calories;
                           return (
+                            <>
+                              {typeof targetCalories === 'number' && (
+                                <div className="bg-indigo-50/50 p-8 rounded-[2rem] border border-indigo-100/50 shadow-sm flex items-center justify-between col-span-1 md:col-span-2 group hover:bg-indigo-50 transition-all">
+                                  <h3 className="text-sm font-bold text-indigo-500 uppercase tracking-widest flex items-center gap-2">Target Calories</h3>
+                                  <p className="text-4xl font-extrabold text-indigo-950">{targetCalories} <span className="text-sm font-bold text-indigo-400">kcal</span></p>
+                                </div>
+                              )}
+                              {orderedMealEntries(dayPlan).map(([meal, info], i) => (
                             <div key={meal} className="bg-white p-8 rounded-[2rem] border border-gray-100 shadow-[0_4px_20px_rgb(0,0,0,0.02)] hover:shadow-[0_8px_30px_rgb(0,0,0,0.06)] transition-all group">
                               <h3 className="text-sm font-bold text-gray-400 uppercase tracking-widest mb-4 flex items-center gap-2">
                                 <span className="w-6 h-6 rounded-full bg-black text-white text-[10px] flex items-center justify-center">{i+1}</span>
@@ -477,8 +533,10 @@ export default function DietGenerator() {
                                 <p className="text-lg font-medium text-black leading-relaxed">{info as string}</p>
                               )}
                             </div>
+                              ))}
+                            </>
                           );
-                        })}
+                        })()}
                       </div>
                     </motion.div>
                   )}
