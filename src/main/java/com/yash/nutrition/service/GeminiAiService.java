@@ -26,8 +26,20 @@ public class GeminiAiService {
     @Value("${gemini.api.url}")
     private String apiUrl;
 
+    // If the primary model fails after its own retries, we make ONE attempt against this
+    // lighter/less-contested model before giving up. Leave blank to disable fallback.
+    @Value("${gemini.api.fallback-url:https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent}")
+    private String fallbackApiUrl;
+
     private static final String TIMEOUT_MSG = "AI is taking longer than expected. Please try again.";
     private static final String UNAVAILABLE_MSG = "AI service is currently unavailable. Please configure the API key to enable this feature.";
+
+    // Small prompt/output (single day) — generous but shouldn't often be needed in full.
+    private static final int DAILY_TIMEOUT_SECONDS = 35;
+    // Larger prompt/output (7 days x 4 meals x 6 fields) — needs more headroom.
+    private static final int WEEKLY_TIMEOUT_SECONDS = 55;
+    // Default for chat/recommendations (small, conversational responses).
+    private static final int DEFAULT_TIMEOUT_SECONDS = 30;
 
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
@@ -45,14 +57,18 @@ public class GeminiAiService {
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    public Mono<AiDietResponse> generateDietPlan(AiRequest request, String username) {
+    /**
+     * Fast path: generates ONLY today's plan (calories, macros, meal_plan, tips).
+     * Small prompt, small output => reliable within a short timeout.
+     */
+    public Mono<AiDietResponse> generateDailyDietPlan(AiRequest request, String username) {
         if (isApiKeyMissing()) {
-            logger.warning("Gemini API key is missing. Returning fallback.");
-            return Mono.just(getFallbackDietResponse());
+            logger.warning("Gemini API key is missing.");
+            return Mono.just(AiDietResponse.error("AI unavailable", UNAVAILABLE_MSG));
         }
 
-        String prompt = buildDietPrompt(request);
-        return callWithRetry(prompt)
+        String prompt = buildDailyDietPrompt(request);
+        return callWithRetry(prompt, DAILY_TIMEOUT_SECONDS)
                 .map(jsonResponse -> {
                     try {
                         AiDietResponse response = objectMapper.readValue(jsonResponse, AiDietResponse.class);
@@ -69,27 +85,67 @@ public class GeminiAiService {
                         saved.setCarbs(response.getMacros().getCarbs());
                         saved.setFats(response.getMacros().getFats());
                         saved.setMealPlanJson(objectMapper.writeValueAsString(response.getMeal_plan()));
-                        if (response.getWeekly_plan() != null) {
-                            saved.setWeeklyPlanJson(objectMapper.writeValueAsString(response.getWeekly_plan()));
-                        }
                         saved.setTipsJson(objectMapper.writeValueAsString(response.getTips()));
                         savedDietPlanRepository.save(saved);
 
                         response.setSuccess(true);
                         return response;
                     } catch (Exception e) {
-                        logger.warning("Error parsing diet plan: " + e.getMessage());
+                        logger.warning("Error parsing daily diet plan: " + e.getMessage());
                         return AiDietResponse.error("Parsing failed", e.getMessage());
                     }
                 })
                 .onErrorResume(e -> {
-                    logger.severe("Gemini AI API Failed: " + e.getMessage());
-                    return Mono.just(AiDietResponse.error("Gemini API failed", e.getMessage()));
+                    logger.severe("Gemini AI API Failed (daily): " + e.getMessage());
+                    return Mono.error(e);
                 });
     }
 
-    public Mono<AiDietResponse> generateWeeklyPlan(AiRequest request) {
-        return generateDietPlan(request, "guest");
+    /**
+     * Separate, on-demand path: generates ONLY the 7-day weekly plan.
+     * Larger output than the daily call, so it gets a longer timeout,
+     * but it's still far smaller than the old combined daily+weekly prompt.
+     */
+    public Mono<AiDietResponse> generateWeeklyDietPlan(AiRequest request, String username) {
+        if (isApiKeyMissing()) {
+            logger.warning("Gemini API key is missing.");
+            return Mono.just(AiDietResponse.error("AI unavailable", UNAVAILABLE_MSG));
+        }
+
+        // Look up the most recent saved (daily) plan FIRST, so we can lock the weekly
+        // prompt to the same calorie/macro target instead of letting the model recompute
+        // its own numbers from scratch. Two independent Gemini calls given the same profile
+        // are not guaranteed to agree on calories (e.g. 2014 vs 2550) — this keeps them in sync.
+        List<com.yash.nutrition.entity.SavedDietPlan> pastPlans =
+                savedDietPlanRepository.findByUserIdOrderByCreatedAtDesc(username != null ? username : "guest");
+        com.yash.nutrition.entity.SavedDietPlan latest = pastPlans.isEmpty() ? null : pastPlans.get(0);
+
+        String prompt = buildWeeklyDietPrompt(request, latest);
+        return callWithRetry(prompt, WEEKLY_TIMEOUT_SECONDS)
+                .map(jsonResponse -> {
+                    try {
+                        AiDietResponse response = objectMapper.readValue(jsonResponse, AiDietResponse.class);
+                        if (response == null || response.getWeekly_plan() == null || response.getWeekly_plan().isEmpty()) {
+                            return AiDietResponse.error("Validation failed", "Invalid JSON format returned by AI.");
+                        }
+
+                        // Attach the weekly plan onto the user's most recent saved plan, if any
+                        if (latest != null) {
+                            latest.setWeeklyPlanJson(objectMapper.writeValueAsString(response.getWeekly_plan()));
+                            savedDietPlanRepository.save(latest);
+                        }
+
+                        response.setSuccess(true);
+                        return response;
+                    } catch (Exception e) {
+                        logger.warning("Error parsing weekly diet plan: " + e.getMessage());
+                        return AiDietResponse.error("Parsing failed", e.getMessage());
+                    }
+                })
+                .onErrorResume(e -> {
+                    logger.severe("Gemini AI API Failed (weekly): " + e.getMessage());
+                    return Mono.error(e);
+                });
     }
 
     public Mono<AiRecommendationsResponse> generateRecommendations(AiRequest request) {
@@ -114,7 +170,7 @@ public class GeminiAiService {
                 })
                 .onErrorResume(e -> {
                     logger.severe("Gemini AI API Failed: " + e.getMessage());
-                    return Mono.just(AiRecommendationsResponse.error("Gemini API failed", e.getMessage()));
+                    return Mono.error(e);
                 });
     }
 
@@ -154,7 +210,7 @@ public class GeminiAiService {
                 })
                 .onErrorResume(e -> {
                     logger.severe("Gemini AI API Failed: " + e.getMessage());
-                    return Mono.just(com.yash.nutrition.dto.AiChatResponse.error("Gemini API failed", e.getMessage()));
+                    return Mono.error(e);
                 });
     }
 
@@ -164,9 +220,38 @@ public class GeminiAiService {
         return apiKey == null || apiKey.isBlank();
     }
 
-    @SuppressWarnings("unchecked")
     private Mono<String> callWithRetry(String prompt) {
-        String url = apiUrl + "?key=" + apiKey;
+        return callWithRetry(prompt, DEFAULT_TIMEOUT_SECONDS);
+    }
+
+    /**
+     * Tries the primary model first. If it fails after its own retries (429/503/timeout),
+     * makes ONE attempt against the fallback model before giving up entirely.
+     * This keeps result quality high when possible while adding resilience against
+     * free-tier overload, without permanently switching everyone to the lighter model.
+     */
+    private Mono<String> callWithRetry(String prompt, int timeoutSeconds) {
+        Mono<String> primaryAttempt = attemptCall(prompt, timeoutSeconds, apiUrl);
+
+        if (fallbackApiUrl == null || fallbackApiUrl.isBlank() || fallbackApiUrl.equals(apiUrl)) {
+            return primaryAttempt;
+        }
+
+        return primaryAttempt.onErrorResume(primaryError -> {
+            logger.warning("Primary Gemini model failed, trying fallback model. Reason: " + primaryError.getMessage());
+            return attemptCall(prompt, timeoutSeconds, fallbackApiUrl)
+                    .doOnSuccess(r -> logger.info("Fallback model succeeded."))
+                    .onErrorResume(fallbackError -> {
+                        logger.severe("Fallback Gemini model also failed: " + fallbackError.getMessage());
+                        // Surface the ORIGINAL error — it's usually more informative (e.g. real 503 vs timeout).
+                        return Mono.error(primaryError);
+                    });
+        });
+    }
+
+    @SuppressWarnings("unchecked")
+    private Mono<String> attemptCall(String prompt, int timeoutSeconds, String url) {
+        String fullUrl = url + "?key=" + apiKey;
         String sanitizedPrompt = prompt.replace("\"", "\\\"").replace("\n", " ");
 
         String requestBody = """
@@ -184,16 +269,17 @@ public class GeminiAiService {
             """.formatted(sanitizedPrompt);
 
         return webClient.post()
-                .uri(url)
+                .uri(fullUrl)
                 .header("Content-Type", "application/json")
                 .bodyValue(requestBody)
                 .retrieve()
                 .bodyToMono(Map.class)
-                .timeout(Duration.ofSeconds(15))
-                .retryWhen(reactor.util.retry.Retry.fixedDelay(2, Duration.ofSeconds(2))
+                .timeout(Duration.ofSeconds(timeoutSeconds))
+                .retryWhen(reactor.util.retry.Retry.backoff(3, Duration.ofSeconds(2))
                         .filter(throwable -> {
                             if (throwable instanceof org.springframework.web.reactive.function.client.WebClientResponseException) {
-                                return ((org.springframework.web.reactive.function.client.WebClientResponseException) throwable).getStatusCode().value() == 429;
+                                int status = ((org.springframework.web.reactive.function.client.WebClientResponseException) throwable).getStatusCode().value();
+                                return status == 429 || status == 503;
                             }
                             return false;
                         }))
@@ -213,7 +299,7 @@ public class GeminiAiService {
                             .replaceAll("`json", "")
                             .replaceAll("`", "")
                             .trim();
-                    System.out.println("========== RAW GEMINI API RESPONSE ==========");
+                    System.out.println("========== RAW GEMINI API RESPONSE (" + url + ") ==========");
                     System.out.println(cleanResponse);
                     System.out.println("=============================================");
                     return cleanResponse;
@@ -222,9 +308,14 @@ public class GeminiAiService {
 
     // ── Prompt builders ───────────────────────────────────────────────────────
 
-    private String buildDietPrompt(AiRequest request) {
+    private static final String MEAL_ITEM_SCHEMA =
+            "{ \"name\": \"string (be specific — e.g. '2 boiled eggs, 1 slice whole wheat toast, 1/2 avocado', not just 'eggs')\", " +
+            "\"grams\": \"string (total grams for the whole meal, e.g. '250g')\", " +
+            "\"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }";
+
+    private String buildDailyDietPrompt(AiRequest request) {
         return "You are a professional nutritionist.\n" +
-               "Generate a personalized diet plan based on the following user profile:\n" +
+               "Generate ONE DAY of a personalized, precise diet plan based on the following user profile:\n" +
                "Weight: " + request.getWeight() + " kg\n" +
                "Height: " + request.getHeight() + " cm\n" +
                "Age: " + request.getAge() + " years\n" +
@@ -233,33 +324,68 @@ public class GeminiAiService {
                "Goal: " + request.getGoal() + "\n" +
                "Dietary Preferences: " + request.getDietaryPreferences() + "\n\n" +
                "IMPORTANT DATA RULES:\n" +
+               "- Every meal MUST name specific foods and exact quantities needed to hit its calorie/macro target " +
+               "(e.g. '3 whole eggs + 1 cup oats + 1 banana + 200ml milk'), never a single generic word like 'Eggs' or 'Oats'.\n" +
                "- All numeric values MUST be integers (no quotes, no units like \"150g\").\n" +
                "- Ensure macros (protein, carbs, fats) are strictly integer numbers.\n" +
-               "- Ensure calories is strictly an integer number.\n\n" +
+               "- Ensure calories is strictly an integer number.\n" +
+               "- The four meals' calories must sum to (approximately) the daily \"calories\" value.\n\n" +
                "Return ONLY valid JSON. No explanation. No markdown. No backticks.\n" +
                "Output must strictly follow this structure:\n" +
                "{\n" +
                "  \"calories\": number,\n" +
-               "  \"macros\": {\n" +
-               "    \"protein\": number,\n" +
-               "    \"carbs\": number,\n" +
-               "    \"fats\": number\n" +
-               "  },\n" +
+               "  \"macros\": { \"protein\": number, \"carbs\": number, \"fats\": number },\n" +
                "  \"meal_plan\": {\n" +
-               "    \"breakfast\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number },\n" +
-               "    \"lunch\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number },\n" +
-               "    \"dinner\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number },\n" +
-               "    \"snacks\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }\n" +
+               "    \"breakfast\": " + MEAL_ITEM_SCHEMA + ",\n" +
+               "    \"lunch\": " + MEAL_ITEM_SCHEMA + ",\n" +
+               "    \"dinner\": " + MEAL_ITEM_SCHEMA + ",\n" +
+               "    \"snacks\": " + MEAL_ITEM_SCHEMA + "\n" +
                "  },\n" +
-               "  \"tips\": [\"string\"],\n" +
+               "  \"tips\": [\"string\"]\n" +
+               "}";
+    }
+
+    private String buildWeeklyDietPrompt(AiRequest request, com.yash.nutrition.entity.SavedDietPlan latestPlan) {
+        // Lock the weekly plan onto the SAME calorie/macro target as the user's most recent
+        // daily plan (if one exists), rather than letting the model derive its own number
+        // again from scratch — that's what was causing the daily/weekly mismatch.
+        String targetBlock;
+        if (latestPlan != null && latestPlan.getCalories() > 0) {
+            targetBlock =
+                "FIXED DAILY TARGET (already calculated for this user — do NOT recalculate or deviate from it):\n" +
+                "- Calories: " + latestPlan.getCalories() + " kcal per day\n" +
+                "- Protein: " + latestPlan.getProtein() + "g, Carbs: " + latestPlan.getCarbs() +
+                "g, Fats: " + latestPlan.getFats() + "g per day\n" +
+                "EVERY one of the 7 days must land within about 3% of these exact numbers. " +
+                "Vary the FOODS across days, never the calorie/macro target.\n\n";
+        } else {
+            targetBlock = "";
+        }
+
+        return "You are a professional nutritionist.\n" +
+               "Generate a 7-DAY personalized, precise diet plan based on the following user profile:\n" +
+               "Weight: " + request.getWeight() + " kg\n" +
+               "Height: " + request.getHeight() + " cm\n" +
+               "Age: " + request.getAge() + " years\n" +
+               "Gender: " + request.getGender() + "\n" +
+               "Activity Level: " + request.getActivityLevel() + "\n" +
+               "Goal: " + request.getGoal() + "\n" +
+               "Dietary Preferences: " + request.getDietaryPreferences() + "\n\n" +
+               targetBlock +
+               "IMPORTANT DATA RULES:\n" +
+               "- Every meal MUST name specific foods and exact quantities needed to hit its calorie/macro target " +
+               "(e.g. '3 whole eggs + 1 cup oats + 1 banana + 200ml milk'), never a single generic word like 'Eggs' or 'Oats'.\n" +
+               "- Vary the meals across the 7 days — do not repeat the same meal every day.\n" +
+               "- All numeric values MUST be integers (no quotes, no units like \"150g\").\n" +
+               "- Each day's four meals' calories must sum to (approximately) that day's \"calories\" value, " +
+               "and that day's \"calories\" value must match the FIXED DAILY TARGET above (if given).\n\n" +
+               "Return ONLY valid JSON. No explanation. No markdown. No backticks.\n" +
+               "Output must strictly follow this structure (repeat for all 7 days — " +
+               "monday, tuesday, wednesday, thursday, friday, saturday, sunday):\n" +
+               "{\n" +
                "  \"weekly_plan\": {\n" +
-               "    \"monday\": { \"breakfast\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"lunch\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"dinner\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"snacks\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"calories\": number },\n" +
-               "    \"tuesday\": { \"breakfast\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"lunch\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"dinner\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"snacks\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"calories\": number },\n" +
-               "    \"wednesday\": { \"breakfast\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"lunch\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"dinner\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"snacks\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"calories\": number },\n" +
-               "    \"thursday\": { \"breakfast\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"lunch\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"dinner\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"snacks\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"calories\": number },\n" +
-               "    \"friday\": { \"breakfast\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"lunch\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"dinner\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"snacks\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"calories\": number },\n" +
-               "    \"saturday\": { \"breakfast\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"lunch\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"dinner\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"snacks\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"calories\": number },\n" +
-               "    \"sunday\": { \"breakfast\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"lunch\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"dinner\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"snacks\": { \"name\": \"string\", \"grams\": \"string\", \"calories\": number, \"protein\": number, \"carbs\": number, \"fat\": number }, \"calories\": number }\n" +
+               "    \"monday\": { \"breakfast\": " + MEAL_ITEM_SCHEMA + ", \"lunch\": " + MEAL_ITEM_SCHEMA +
+               ", \"dinner\": " + MEAL_ITEM_SCHEMA + ", \"snacks\": " + MEAL_ITEM_SCHEMA + ", \"calories\": number }\n" +
                "  }\n" +
                "}";
     }
@@ -326,32 +452,6 @@ public class GeminiAiService {
     }
 
     // ── Fallback responses ────────────────────────────────────────────────────
-
-    private AiDietResponse getFallbackDietResponse() {
-        AiDietResponse fallback = new AiDietResponse();
-        fallback.setCalories(2000);
-
-        AiDietResponse.Macros macros = new AiDietResponse.Macros();
-        macros.setProtein(150);
-        macros.setCarbs(200);
-        macros.setFats(66);
-        fallback.setMacros(macros);
-
-        AiDietResponse.MealPlan mealPlan = new AiDietResponse.MealPlan();
-        mealPlan.setBreakfast("Oatmeal with berries and protein powder");
-        mealPlan.setLunch("Grilled chicken salad with quinoa");
-        mealPlan.setDinner("Salmon with roasted vegetables and sweet potato");
-        mealPlan.setSnacks("Greek yogurt with almonds");
-        fallback.setMeal_plan(mealPlan);
-
-        List<String> tips = new ArrayList<>();
-        tips.add("Stay hydrated — aim for at least 2 litres of water daily.");
-        tips.add("Consistent sleep patterns support optimal recovery.");
-        tips.add("This is a generic fallback plan. Please try again for a personalised result.");
-        fallback.setTips(tips);
-
-        return fallback;
-    }
 
     private AiRecommendationsResponse getFallbackRecommendationsResponse() {
         AiRecommendationsResponse fallback = new AiRecommendationsResponse();
