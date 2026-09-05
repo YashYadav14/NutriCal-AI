@@ -9,7 +9,6 @@ Built with **Spring Boot + Next.js**, NutriCal AI helps users plan meals, track 
 # 🚀 Features
 
 ### 🤖 AI Features
-
 * AI Chat Nutrition Coach
 * AI Daily Diet Plan Generator
 * AI Weekly Meal Planner
@@ -18,7 +17,6 @@ Built with **Spring Boot + Next.js**, NutriCal AI helps users plan meals, track 
 * Goal-based diet (weight loss / gain / maintenance)
 
 ### 📊 Dashboard
-
 * Daily calories overview
 * Macro pie chart
 * Nutrition insights
@@ -26,7 +24,6 @@ Built with **Spring Boot + Next.js**, NutriCal AI helps users plan meals, track 
 * AI recommendations
 
 ### 🥗 Meal Planner
-
 * 7-day weekly plan
 * Breakfast / Lunch / Dinner / Snacks
 * Measured quantities
@@ -34,7 +31,6 @@ Built with **Spring Boot + Next.js**, NutriCal AI helps users plan meals, track 
 * Protein / Carbs / Fat per meal
 
 ### 📈 Health Tracking
-
 * BMI calculator
 * Calories calculator
 * Macros calculator
@@ -42,13 +38,11 @@ Built with **Spring Boot + Next.js**, NutriCal AI helps users plan meals, track 
 * Saved diet plans
 
 ### 🔐 Authentication
-
 * JWT Authentication
 * Login / Register
 * User-specific history
 
 ### ⚡ Performance
-
 * Cached AI responses
 * Lazy loaded charts
 * Optimized navigation
@@ -59,7 +53,6 @@ Built with **Spring Boot + Next.js**, NutriCal AI helps users plan meals, track 
 # 🛠 Tech Stack
 
 ### Frontend
-
 * Next.js 14
 * TypeScript
 * Tailwind CSS
@@ -67,7 +60,6 @@ Built with **Spring Boot + Next.js**, NutriCal AI helps users plan meals, track 
 * Axios
 
 ### Backend
-
 * Spring Boot 3
 * Spring Security
 * JWT Authentication
@@ -75,7 +67,6 @@ Built with **Spring Boot + Next.js**, NutriCal AI helps users plan meals, track 
 * MySQL
 
 ### AI
-
 * Google Gemini API
 
 ---
@@ -83,9 +74,11 @@ Built with **Spring Boot + Next.js**, NutriCal AI helps users plan meals, track 
 # 📂 Project Structure
 
 ```
-NutriCal/
- ├── frontend/           # Next.js frontend
- ├── nutrition-backend/  # Spring Boot backend
+NutriCal-AI/
+ ├── frontend/     # Next.js frontend
+ ├── src/          # Spring Boot backend source
+ ├── pom.xml       # Spring Boot backend config (repo root)
+ ├── Dockerfile    # Backend container build
  └── README.md
 ```
 
@@ -96,22 +89,17 @@ NutriCal/
 ## 1. Clone Repository
 
 ```bash
-git clone https://github.com/YashYadav14/NutriCal.git
-cd NutriCal
+git clone https://github.com/YashYadav14/NutriCal-AI.git
+cd NutriCal-AI
 ```
 
 ---
 
 # Backend Setup
 
-Go to backend:
-
-```bash
-cd nutrition-backend
-```
+The backend lives at the **repo root** (`pom.xml`, `src/`, `Dockerfile`) — no need to `cd` into a subfolder.
 
 Create `.env` or add to `application.properties`
-
 ```
 GEMINI_API_KEY=your_key
 SPRING_DATASOURCE_URL=jdbc:mysql://localhost:3306/nutrical
@@ -120,13 +108,11 @@ SPRING_DATASOURCE_PASSWORD=password
 ```
 
 Run backend:
-
 ```bash
 mvn spring-boot:run
 ```
 
 Backend runs on:
-
 ```
 http://localhost:8080
 ```
@@ -136,32 +122,27 @@ http://localhost:8080
 # Frontend Setup
 
 Go to frontend:
-
 ```bash
 cd frontend
 npm install
 ```
 
 Create `.env.local`
-
 ```
 NEXT_PUBLIC_API_URL=http://localhost:8080
 ```
 
 Run frontend:
-
 ```bash
 npm run dev
 ```
 
 Frontend runs on:
-
 ```
 http://localhost:3000
 ```
 
 ---
-
 
 # 🎯 Example Weekly Plan
 
@@ -191,19 +172,15 @@ Almonds (30g)
 # 🌍 Deployment
 
 Frontend:
-
 * Vercel
 
 Backend:
-
 * Render
 
 Database:
-
 * MySQL / Railway
 
 Environment variables:
-
 ```
 NEXT_PUBLIC_API_URL=backend_url
 GEMINI_API_KEY=your_key
