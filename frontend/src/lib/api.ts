@@ -2,7 +2,7 @@ import axios from 'axios';
 
 // ── Base clients ──────────────────────────────────────────────────────────────
 
-const BASE_URL = 'http://localhost:8080';
+const BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
 
 /** Unauthenticated client — used only for login/register */
 export const authClient = axios.create({
