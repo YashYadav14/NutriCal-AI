@@ -4,6 +4,8 @@ NutriCal AI is a full-stack AI-powered nutrition assistant that generates **pers
 
 Built with **Spring Boot + Next.js**, NutriCal AI helps users plan meals, track calories, and improve nutrition intelligently.
 
+🔗 **Live Demo:** [nutri-cal-ai.vercel.app](https://nutri-cal-ai.vercel.app)
+
 ---
 
 # 🚀 Features
